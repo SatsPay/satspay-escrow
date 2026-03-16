@@ -1,0 +1,30 @@
+[project]
+name = 'satspay-escrow'
+description = ''
+authors = []
+telemetry = true
+cache_dir = './.cache'
+requirements = []
+[contracts.satspay-escrow]
+path = 'contracts/satspay-escrow.clar'
+clarity_version = 4
+epoch = 'latest'
+[repl.analysis]
+passes = [
+    'call_checker',
+    'check_checker',
+]
+
+[repl.analysis.lint_groups]
+
+[repl.analysis.lints]
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
+
+[repl.remote_data]
+enabled = false
+api_url = 'https://api.hiro.so'
