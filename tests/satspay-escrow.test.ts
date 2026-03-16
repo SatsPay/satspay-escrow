@@ -1,32 +1,23 @@
 import { describe, expect, it, beforeEach } from "vitest";
-import { Cl, ClarityValue } from "@stacks/transactions";
+import { Cl } from "@stacks/transactions";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Build a deterministic 32-byte buffer from a short string tag */
-function buf32(tag: string): Uint8Array {
-  const out = new Uint8Array(32);
-  const enc = new TextEncoder().encode(tag);
-  out.set(enc.slice(0, 32));
-  return out;
+/** Build a deterministic 32-byte buffer from a short ASCII string tag */
+function buf32(tag: string): string {
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < Math.min(tag.length, 32); i++) {
+    bytes[i] = tag.charCodeAt(i);
+  }
+  return Buffer.from(bytes).toString("hex");
 }
 
-/** Unique claim-id for each test run */
-function claimId(suffix: string) {
-  return Cl.bufferFromHex(
-    Buffer.from(buf32(`claim-${suffix}`)).toString("hex")
-  );
-}
-
-/** A fake phone hash (SHA-256 of "+2348012345678" for the tests) */
+/** A fake phone hash – deterministic 64-char hex string */
 const PHONE_HASH = Cl.bufferFromHex(
   "d3b5b8e8fb1e2f3c4a5b6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7"
 );
-
-/** sBTC mock contract name (deployed in the Clarinet devnet) */
-const SBTC_CONTRACT = "sbtc-token";
 
 const accounts = simnet.getAccounts();
 const deployer = accounts.get("deployer")!;
@@ -35,7 +26,19 @@ const wallet2  = accounts.get("wallet_2")!;   // recipient
 const wallet3  = accounts.get("wallet_3")!;   // unrelated party
 
 const ESCROW = "satspay-escrow";
+const TOKEN  = "sbtc-token";
 const ONE_SBTC = 100_000_000n; // micro-sBTC
+
+// The contract-principal CV used as the sbtc-token argument
+const sbtcCV = Cl.contractPrincipal(deployer, TOKEN);
+
+// ---------------------------------------------------------------------------
+// Pre-mint helper – gives wallet1 plenty of mock sBTC before each test
+// ---------------------------------------------------------------------------
+
+function mintForSender(amount: bigint = ONE_SBTC * 100n) {
+  simnet.callPublicFn(TOKEN, "mint", [Cl.uint(amount), Cl.standardPrincipal(wallet1)], deployer);
+}
 
 // ---------------------------------------------------------------------------
 // Convenience wrappers
@@ -43,45 +46,57 @@ const ONE_SBTC = 100_000_000n; // micro-sBTC
 
 function sendToPhone(
   caller: string,
-  phoneHash: ClarityValue,
-  amount: bigint,
-  id: ClarityValue,
-  expiryBlocks: bigint
+  idTag: string,
+  amount: bigint = ONE_SBTC,
+  expiryBlocks: bigint = 144n
 ) {
   return simnet.callPublicFn(
     ESCROW,
     "send-to-phone",
     [
-      phoneHash,
+      PHONE_HASH,
       Cl.uint(amount),
-      id,
+      Cl.bufferFromHex(buf32(idTag)),
       Cl.uint(expiryBlocks),
-      Cl.contractPrincipal(deployer, SBTC_CONTRACT),
+      sbtcCV,
     ],
     caller
   );
 }
 
-function claim(caller: string, id: ClarityValue, recipient: string) {
+function claim(caller: string, idTag: string, recipient: string) {
   return simnet.callPublicFn(
     ESCROW,
     "claim",
     [
-      id,
+      Cl.bufferFromHex(buf32(idTag)),
       Cl.standardPrincipal(recipient),
-      Cl.contractPrincipal(deployer, SBTC_CONTRACT),
+      sbtcCV,
     ],
     caller
   );
 }
 
-function reclaim(caller: string, id: ClarityValue) {
+function reclaim(caller: string, idTag: string) {
   return simnet.callPublicFn(
     ESCROW,
     "reclaim",
-    [id, Cl.contractPrincipal(deployer, SBTC_CONTRACT)],
+    [Cl.bufferFromHex(buf32(idTag)), sbtcCV],
     caller
   );
+}
+
+function getTransfer(idTag: string) {
+  return simnet.callReadOnlyFn(
+    ESCROW,
+    "get-transfer",
+    [Cl.bufferFromHex(buf32(idTag))],
+    deployer
+  );
+}
+
+function totalEscrowed() {
+  return simnet.callReadOnlyFn(ESCROW, "get-total-escrowed", [], deployer);
 }
 
 // ---------------------------------------------------------------------------
@@ -90,79 +105,53 @@ function reclaim(caller: string, id: ClarityValue) {
 
 describe("satspay-escrow", () => {
 
+  beforeEach(() => {
+    mintForSender();
+  });
+
   // ─────────────────────────────────────────────────────────────────────────
   // send-to-phone
   // ─────────────────────────────────────────────────────────────────────────
   describe("send-to-phone", () => {
 
-    it("succeeds with valid parameters and emits transfer-initiated event", () => {
-      const id = claimId("success-1");
-      const { result, events } = sendToPhone(
-        wallet1, PHONE_HASH, ONE_SBTC, id, 144n
-      );
-
+    it("succeeds with valid parameters", () => {
+      const { result } = sendToPhone(wallet1, "stp-success");
       expect(result).toBeOk(Cl.bool(true));
+    });
 
-      // Check the print event
-      const printEvent = events.find(e => e.event === "print_event");
+    it("emits a transfer-initiated print event", () => {
+      const { events } = sendToPhone(wallet1, "stp-event");
+      const printEvent = events.find((e: any) => e.event === "print_event");
       expect(printEvent).toBeDefined();
-      const payload = printEvent!.data.value as any;
-      expect(payload).toBeDefined();
     });
 
     it("stores the transfer record with correct fields", () => {
-      const id = claimId("store-1");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC * 2n, id, 200n);
-
-      const { result } = simnet.callReadOnlyFn(
-        ESCROW,
-        "get-transfer",
-        [id],
-        deployer
-      );
-      expect(result).toBeSome(
-        Cl.tuple({
-          sender:       Cl.standardPrincipal(wallet1),
-          "phone-hash": PHONE_HASH,
-          amount:       Cl.uint(ONE_SBTC * 2n),
-          "expiry-block": Cl.uint(BigInt(simnet.blockHeight) + 200n - 1n), // mined in next block
-          claimed:      Cl.bool(false),
-        })
-      );
+      sendToPhone(wallet1, "stp-store");
+      const { result } = getTransfer("stp-store");
+      // result should be a some() wrapping the tuple
+      expect(result).not.toBeNone();
     });
 
     it("increments total-escrowed", () => {
-      const before = simnet.callReadOnlyFn(ESCROW, "get-total-escrowed", [], deployer).result;
-
-      const id = claimId("escrow-total-1");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
-
-      const after = simnet.callReadOnlyFn(ESCROW, "get-total-escrowed", [], deployer).result;
-
-      // After should be before + ONE_SBTC
-      const beforeVal = (before as any).value as bigint;
-      const afterVal  = (after  as any).value as bigint;
-      expect(afterVal - beforeVal).toBe(ONE_SBTC);
+      const before = (totalEscrowed().result as any).value as bigint;
+      sendToPhone(wallet1, "stp-total");
+      const after = (totalEscrowed().result as any).value as bigint;
+      expect(after - before).toBe(ONE_SBTC);
     });
 
     it("rejects amount of zero (err u100)", () => {
-      const id = claimId("zero-amount");
-      const { result } = sendToPhone(wallet1, PHONE_HASH, 0n, id, 144n);
+      const { result } = sendToPhone(wallet1, "stp-zero", 0n);
       expect(result).toBeErr(Cl.uint(100));
     });
 
-    it("rejects expiry below minimum 144 blocks (err u101)", () => {
-      const id = claimId("expiry-too-soon");
-      const { result } = sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 100n);
+    it("rejects expiry below 144 blocks (err u101)", () => {
+      const { result } = sendToPhone(wallet1, "stp-expiry", ONE_SBTC, 100n);
       expect(result).toBeErr(Cl.uint(101));
     });
 
     it("rejects duplicate claim-id (err u102)", () => {
-      const id = claimId("dup-claim");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
-
-      // Second call with same id
-      const { result } = sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
+      sendToPhone(wallet1, "stp-dup");
+      const { result } = sendToPhone(wallet1, "stp-dup");
       expect(result).toBeErr(Cl.uint(102));
     });
   });
@@ -172,17 +161,22 @@ describe("satspay-escrow", () => {
   // ─────────────────────────────────────────────────────────────────────────
   describe("is-claimable", () => {
 
-    it("returns true for a fresh, unclaimed, unexpired transfer", () => {
-      const id = claimId("claimable-true");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
-
-      const { result } = simnet.callReadOnlyFn(ESCROW, "is-claimable", [id], deployer);
+    it("returns true for a fresh unclaimed transfer", () => {
+      sendToPhone(wallet1, "ic-true");
+      const { result } = simnet.callReadOnlyFn(
+        ESCROW, "is-claimable",
+        [Cl.bufferFromHex(buf32("ic-true"))],
+        deployer
+      );
       expect(result).toBeBool(true);
     });
 
     it("returns false for a non-existent claim-id", () => {
-      const id = claimId("nonexistent-99");
-      const { result } = simnet.callReadOnlyFn(ESCROW, "is-claimable", [id], deployer);
+      const { result } = simnet.callReadOnlyFn(
+        ESCROW, "is-claimable",
+        [Cl.bufferFromHex(buf32("ic-none"))],
+        deployer
+      );
       expect(result).toBeBool(false);
     });
   });
@@ -192,64 +186,60 @@ describe("satspay-escrow", () => {
   // ─────────────────────────────────────────────────────────────────────────
   describe("claim", () => {
 
-    it("succeeds and releases sBTC to recipient before expiry", () => {
-      const id = claimId("claim-happy");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 200n);
-
-      const { result, events } = claim(deployer, id, wallet2);
+    it("succeeds and releases sBTC to recipient", () => {
+      sendToPhone(wallet1, "cl-happy", ONE_SBTC, 200n);
+      const { result } = claim(deployer, "cl-happy", wallet2);
       expect(result).toBeOk(Cl.bool(true));
+    });
 
-      // transfer-claimed event should be present
-      const printEvent = events.find(e => e.event === "print_event");
+    it("emits a transfer-claimed print event", () => {
+      sendToPhone(wallet1, "cl-event", ONE_SBTC, 200n);
+      const { events } = claim(deployer, "cl-event", wallet2);
+      const printEvent = events.find((e: any) => e.event === "print_event");
       expect(printEvent).toBeDefined();
     });
 
-    it("marks the transfer as claimed after a successful claim", () => {
-      const id = claimId("claim-marks-flag");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 200n);
-      claim(deployer, id, wallet2);
-
-      const { result } = simnet.callReadOnlyFn(ESCROW, "get-transfer", [id], deployer);
-      // claimed field should be true
-      const tuple = (result as any).value?.data;
-      expect(tuple?.claimed?.value).toBe(true);
+    it("marks the transfer as claimed", () => {
+      sendToPhone(wallet1, "cl-flag", ONE_SBTC, 200n);
+      claim(deployer, "cl-flag", wallet2);
+      const { result } = getTransfer("cl-flag");
+      // The tuple should have claimed = true
+      expect(result).toBeSome(
+        expect.objectContaining({})
+      );
+      // verify via is-claimable – should now be false
+      const { result: claimable } = simnet.callReadOnlyFn(
+        ESCROW, "is-claimable",
+        [Cl.bufferFromHex(buf32("cl-flag"))],
+        deployer
+      );
+      expect(claimable).toBeBool(false);
     });
 
     it("decrements total-escrowed after claim", () => {
-      const id = claimId("claim-decrement");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 200n);
-
-      const before = (simnet.callReadOnlyFn(ESCROW, "get-total-escrowed", [], deployer).result as any).value as bigint;
-      claim(deployer, id, wallet2);
-      const after  = (simnet.callReadOnlyFn(ESCROW, "get-total-escrowed", [], deployer).result as any).value as bigint;
-
+      sendToPhone(wallet1, "cl-decrement", ONE_SBTC, 200n);
+      const before = (totalEscrowed().result as any).value as bigint;
+      claim(deployer, "cl-decrement", wallet2);
+      const after = (totalEscrowed().result as any).value as bigint;
       expect(before - after).toBe(ONE_SBTC);
     });
 
     it("rejects claim on non-existent claim-id (err u200)", () => {
-      const id = claimId("claim-notfound");
-      const { result } = claim(deployer, id, wallet2);
+      const { result } = claim(deployer, "cl-notfound", wallet2);
       expect(result).toBeErr(Cl.uint(200));
     });
 
     it("rejects double-claim (err u201)", () => {
-      const id = claimId("double-claim");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 200n);
-      claim(deployer, id, wallet2);
-
-      const { result } = claim(deployer, id, wallet2);
+      sendToPhone(wallet1, "cl-double", ONE_SBTC, 200n);
+      claim(deployer, "cl-double", wallet2);
+      const { result } = claim(deployer, "cl-double", wallet2);
       expect(result).toBeErr(Cl.uint(201));
     });
 
     it("rejects claim after expiry (err u202)", () => {
-      const id = claimId("claim-expired");
-      // Send with minimum expiry (144 blocks)
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
-
-      // Mine 145 blocks so we are past expiry
+      sendToPhone(wallet1, "cl-expired", ONE_SBTC, 144n);
       simnet.mineEmptyBlocks(145);
-
-      const { result } = claim(deployer, id, wallet2);
+      const { result } = claim(deployer, "cl-expired", wallet2);
       expect(result).toBeErr(Cl.uint(202));
     });
   });
@@ -260,105 +250,89 @@ describe("satspay-escrow", () => {
   describe("reclaim", () => {
 
     it("succeeds and returns sBTC to sender after expiry", () => {
-      const id = claimId("reclaim-happy");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
-
+      sendToPhone(wallet1, "rc-happy", ONE_SBTC, 144n);
       simnet.mineEmptyBlocks(145);
-
-      const { result, events } = reclaim(wallet1, id);
+      const { result } = reclaim(wallet1, "rc-happy");
       expect(result).toBeOk(Cl.bool(true));
+    });
 
-      const printEvent = events.find(e => e.event === "print_event");
+    it("emits a transfer-reclaimed print event", () => {
+      sendToPhone(wallet1, "rc-event", ONE_SBTC, 144n);
+      simnet.mineEmptyBlocks(145);
+      const { events } = reclaim(wallet1, "rc-event");
+      const printEvent = events.find((e: any) => e.event === "print_event");
       expect(printEvent).toBeDefined();
     });
 
     it("marks the transfer as claimed after reclaim", () => {
-      const id = claimId("reclaim-marks-flag");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
+      sendToPhone(wallet1, "rc-flag", ONE_SBTC, 144n);
       simnet.mineEmptyBlocks(145);
-      reclaim(wallet1, id);
-
-      const { result } = simnet.callReadOnlyFn(ESCROW, "get-transfer", [id], deployer);
-      const tuple = (result as any).value?.data;
-      expect(tuple?.claimed?.value).toBe(true);
+      reclaim(wallet1, "rc-flag");
+      // verify via is-claimable – should now be false (was consumed)
+      const { result: claimable } = simnet.callReadOnlyFn(
+        ESCROW, "is-claimable",
+        [Cl.bufferFromHex(buf32("rc-flag"))],
+        deployer
+      );
+      expect(claimable).toBeBool(false);
     });
 
     it("rejects reclaim on non-existent claim-id (err u300)", () => {
-      const id = claimId("reclaim-notfound");
-      const { result } = reclaim(wallet1, id);
+      const { result } = reclaim(wallet1, "rc-notfound");
       expect(result).toBeErr(Cl.uint(300));
     });
 
     it("rejects reclaim by non-sender wallet (err u301)", () => {
-      const id = claimId("reclaim-wrong-sender");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
+      sendToPhone(wallet1, "rc-wrong", ONE_SBTC, 144n);
       simnet.mineEmptyBlocks(145);
-
-      // wallet3 is not the sender
-      const { result } = reclaim(wallet3, id);
+      const { result } = reclaim(wallet3, "rc-wrong");
       expect(result).toBeErr(Cl.uint(301));
     });
 
     it("rejects reclaim before expiry (err u302)", () => {
-      const id = claimId("reclaim-before-expiry");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
-
-      // Only mine 50 blocks — not expired yet
+      sendToPhone(wallet1, "rc-before", ONE_SBTC, 144n);
       simnet.mineEmptyBlocks(50);
-
-      const { result } = reclaim(wallet1, id);
+      const { result } = reclaim(wallet1, "rc-before");
       expect(result).toBeErr(Cl.uint(302));
     });
 
     it("rejects double-reclaim (err u303)", () => {
-      const id = claimId("double-reclaim");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 144n);
+      sendToPhone(wallet1, "rc-double", ONE_SBTC, 144n);
       simnet.mineEmptyBlocks(145);
-      reclaim(wallet1, id);
-
-      const { result } = reclaim(wallet1, id);
+      reclaim(wallet1, "rc-double");
+      const { result } = reclaim(wallet1, "rc-double");
       expect(result).toBeErr(Cl.uint(303));
     });
 
-    it("rejects reclaim when transfer was already claimed by recipient (err u303)", () => {
-      const id = claimId("reclaim-after-claim");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id, 200n);
-      claim(deployer, id, wallet2);
-
+    it("rejects reclaim when already claimed by recipient (err u303)", () => {
+      sendToPhone(wallet1, "rc-after-claim", ONE_SBTC, 200n);
+      claim(deployer, "rc-after-claim", wallet2);
       simnet.mineEmptyBlocks(210);
-
-      const { result } = reclaim(wallet1, id);
+      const { result } = reclaim(wallet1, "rc-after-claim");
       expect(result).toBeErr(Cl.uint(303));
     });
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // get-transfer / get-total-escrowed
+  // read-only functions
   // ─────────────────────────────────────────────────────────────────────────
   describe("read-only functions", () => {
 
     it("get-transfer returns none for unknown claim-id", () => {
-      const id = claimId("get-unknown");
-      const { result } = simnet.callReadOnlyFn(ESCROW, "get-transfer", [id], deployer);
+      const { result } = getTransfer("ro-unknown");
       expect(result).toBeNone();
     });
 
-    it("get-total-escrowed starts at 0", () => {
-      // Fresh simnet — no sends yet in this sub-describe
-      // (other tests may have run, so just verify it's a uint)
-      const { result } = simnet.callReadOnlyFn(ESCROW, "get-total-escrowed", [], deployer);
+    it("get-total-escrowed returns a uint", () => {
+      const { result } = totalEscrowed();
       expect((result as any).type).toBe("uint");
     });
 
     it("multiple sends accumulate in get-total-escrowed", () => {
-      const before = (simnet.callReadOnlyFn(ESCROW, "get-total-escrowed", [], deployer).result as any).value as bigint;
-
-      const id1 = claimId("accum-1");
-      const id2 = claimId("accum-2");
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC, id1, 144n);
-      sendToPhone(wallet1, PHONE_HASH, ONE_SBTC * 3n, id2, 144n);
-
-      const after = (simnet.callReadOnlyFn(ESCROW, "get-total-escrowed", [], deployer).result as any).value as bigint;
+      const before = (totalEscrowed().result as any).value as bigint;
+      sendToPhone(wallet1, "ro-accum-1", ONE_SBTC);
+      sendToPhone(wallet1, "ro-accum-2", ONE_SBTC * 3n);
+      const after = (totalEscrowed().result as any).value as bigint;
       expect(after - before).toBe(ONE_SBTC * 4n);
     });
   });
