@@ -9,11 +9,13 @@ requirements = []
 path = 'contracts/satspay-escrow.clar'
 clarity_version = 4
 epoch = 'latest'
+
 [repl.analysis]
 passes = [
     'call_checker',
     'check_checker',
 ]
+
 
 [repl.analysis.lint_groups]
 
